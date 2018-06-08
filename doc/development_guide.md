@@ -168,7 +168,7 @@ DPVS开发者指南
 
 其实LVS的性能瓶颈主要受限于Kernel，这么说也许许多人也许会很奇怪，毕竟Kernel一向给人以高水准，高性能的印象。而且多年来Kernel对网络部分的优化也从未停止，为何会成为性能瓶颈？ 首先，我们先看两组数据，一组是Google `Maglev`的，一组是`mTCP`的，这样对内核性能瓶颈有个直观的印象。
 
-<center class="half">
+<center>
     <img src="pics/maglev-throughput.png" height="220"/>
     <img src="pics/mtcp-cps.png" height="220"/>
 </center>
@@ -186,8 +186,6 @@ DPVS开发者指南
 * 上下文切换的开销
 * 锁的使用影响性能
 * 大流量下中断过多（中断风暴）
-* 数据拷贝的开销
-* Cache Miss
 * 复杂的协议栈导致路径过长
 
 下面我们来以此说明一下。
@@ -204,36 +202,121 @@ DPVS开发者指南
 
 锁意味着，当拿不到资源的时候，只能等待（不论是切换出去等，还是忙等）都会造成CPU浪费，降低性能。SMP和进/线程多的情况下问题更加突出。虽然人们采用各种优化锁的技术，读写锁，spinlock，RCU，顺序锁...但是不管怎么锁法，都不如“没锁”来的高效。
 
-但是Kernel资源共享的本质，却不可能没有锁的使用。就它的协议栈来说，虚拟设备需要锁，L2/L3/L4分用需要锁，Netfilter的hooks表需要锁，Conntrack需要锁，路由/ARP/IP地址需要锁，TCP/UDP层有锁，Socket层需要锁，TC(qdisc)需要锁... 实现了LVS的`ipvs`模块，虽然Ali/LVS版本放在`PRE_ROUTEING`进行尽早处理，某个版本connection表进行了per-CPU等优化，但它最终也是需要用到锁的(service, sched, dest等模块都需要)。
+但是Kernel资源共享的本质，却不可能没有锁的使用。就它的协议栈来说，虚拟设备需要锁，L2/L3/L4分用需要锁，Netfilter的hooks表需要锁，Conntrack需要锁，路由/ARP/IP地址需要锁，TCP/UDP层有锁，Socket层需要锁，TC(qdisc)需要锁...
 
-Unix/Linux及其网络协议栈，从来就不是为单个进程，单个用户场景服务的“专用”OS或者协议栈，设计之初也不是为SMP多CPU设计的。性能的提升和优化，只能是在资源共享、公平的前提下进行。可以缩小锁的范围，使用合适的锁，有些地方甚至可以per-CPU避免锁的使用，但终究太多资源共享了。毕竟不能破坏多用户、多任务，通用系统，公平这些大前提。
+Unix/Linux是“通用目的的操作系统”，它们从来就不是为单个进程，某个高性能场景服务的“专用设备”而生。设计之初也不是为SMP多CPU优化的。性能的提升和优化，只能是在资源共享、公平的前提下进行。比如缩小锁的范围，使用合适的锁，有些地方甚至可以per-CPU避免锁的使用，但终究太多资源共享了。毕竟不能破坏多用户、多任务，通用系统，公平这些大前提。因此，在某些特殊的高性能领域内Kernel协议栈表现的不够高效就比较好理解了。包括高速包转发，抗DDoS等。另外一方面，网卡的性能却逐渐提高，10G->25G->40G->100G不成为瓶颈。如果只是为了某个单一类型的应用，甚至硬件都可以是特定的，为什么还有跑一个完整的操作系统(协议栈)呢？
 
 ##### 中断模式
-
+G
 我们知道Kernel网卡驱动的收发包部分是中断（硬，软IRQ）和下半部实现的，通过NAPI接口实现了“中断加轮询”的方式，一方面利用中断来及时处理响应避免对用户造成延迟，另一方面为了兼顾吞吐量等性能，每次中断处理函数会以一定的配额去轮询(poll)设备的报文。这种机制，再结合各种硬件offload，和软件优化方案，能够最大程度兼顾大部分的延时和性能需求。
 
 然而在高性能，高pps的特殊网络应用场景下，这种模式依然显得力不从心，当网络I/O（pps）非常大的时候可以看到CPU被大量消耗在软中断上。虽然可以使用中断/CPU亲核心设置充分利用网卡多队列和多core的能力，但中断本身还是会成为瓶颈的一部分。
 
-DPDK的方案是轮询 。为什么会是“轮询”？ 以前一提轮询，首先首先想到浪费CPU，其次，如果间隔过长会造成不必要的延迟，怎么设置这个间隔都不好。但是，如果是不考虑CPU浪费，没有间隔，以“死循环”方式进行轮询，那么延迟问题能解决和性能也能大幅提升了。
+DPDK的方案是轮询 。为什么会是“轮询”？ 一提轮询，大家首先想到间隔太短浪费CPU，间隔过长会造成不必要的延迟，怎么设置这个间隔都不好。但是，如果是不考虑CPU浪费，没有间隔，以“死循环”方式进行轮询，每次轮询尝试批量读取和处理数据，那么延迟问题能解决和性能也能大幅提升了。毕竟这个CPU全力在处理包的接收。
+
+##### 强大也复杂的协议栈
+
+即便每个函数都优化到极致、不消耗很多CPU，但是如果一个数据通过的函数调用链过长，其累计的性能消耗也会比较大。Kernel实现了太多的复杂的功能，Netfilter及相关的表和规则，ConnTrack系统，各种各样的QoS，GRO/TSO。为了封装不同协议、驱动等实现的抽象封装。这意味着一个数据包在内核中需要通过的函数非常的多，路径非常长，小的消耗积少成多。看看下图，Kernel网络栈的收发部分是不是特别的“高”？ 因为多层函数调用累计的消耗所占的比例就不算小了。在某些特殊的场景，其实不需要那么多的功能。
+
+<center>
+   <img src="pics/linux-perf-flame.png" width="520"/>
+</center>
+
+> 1. 图片来自ACM论文：https://queue.acm.org/detail.cfm?ref=rss&id=2927301
+> 2. 同时也可以看到，用户态/内核直接的数据拷贝是否消耗CPU。不过LVS是内核态实现的，它没有这个问题。
 
 ##### 数据拷贝
 
-##### Cache Miss
+> 首先说明，这点和LVS的性能可能关系没有那么大，因为内核态实现的ipvs，是不需要把数据copy到用户态再拷回去的，只是说数据拷贝非常影响性能。
 
-##### 强大也复杂
+网络数据通过内核和用户态边界的时候，不但有系统调用的开销，还需要一次额外的数据拷贝。如果能从网卡DMA到内存后，整个处理过程不存在额外的拷贝，也能提高性能。Linux的Sendfile机制就可以避免这种拷贝开销。而Kernel-bypass方案可以避免用户态/内核直接的拷贝，对于用户态转发数据而言会有两次拷贝。
 
+# 如何提高性能
 
+那么怎么怎么才能提高性能呢？ 经过上面的分析，我们知道传统LVS在高并发高流量下的性能瓶颈主要在Kernel。首先，简单直接的方法“Kernel-bypass”，绕过了Kernel既然也就没有了那些性能约束了。当然，事情并没有那么简单，我们从"Kernel-bypass"开始，结合其他的一些比较重要的技术，逐步分析如何综合利用他们来提高性能。
 
-### Kernel-bypass技术
+### 使用Kernel-bypass
 
-https://www.infoworld.com/article/3189664/networking/sdn-dilemma-linux-kernel-networking-vs-kernel-bypass.html
+###### 优点：高性能
 
-> 当然Kernel也在不停的进化，比如说我们这里的提到的开源Ali/LVS，它的内核还是2.6.32，已经是非常“老”的Kernel了。Kernel对性能的追求从未止步过，多年前的"中断+轮询"，设备驱动napi/上下半部改造，RPS/LRO/GRO/..., REUSEPORT, 等等各种优化的引入，包括最近的XDP/eBFP方面的努力（也许正是针对DPDK这种kernel-bypass的威胁），还有各种TCP层，Socket层的优化，手段如此之多。所以说`Kernal-bypass`技术和Kernel自身的演化和对比应该是个动态的过程。
+使用Kernel-bypass技术可以避免kernel的瓶颈，解决上述提到的几个问题，带来成倍的性能提升。
 
-没有银弹， 正方和反方观点，
-https://blog.cloudflare.com/kernel-bypass/
-http://lukego.github.io/blog/2013/01/04/kernel-bypass-networking/
-https://technologyevangelist.co/2017/12/05/kernel-bypass-security-bypass/
-https://people.netfilter.org/hawk/presentations/LCA2015/net_stack_challenges_100G_LCA2015.pdf
+除了性能之外，其他的好处包括：
 
-#
+###### 优点：用户态相对Kernel开发、和被采纳周期更短
+
+  看看QUIC和TCP的改进就知道了，很多东西可以在QUIC上快速实验和应用，但是在TCP层实现意味着漫长的内核开发、采纳时间.另一个问题是无法强制用户去经常去升级Kernel，但升级一个app却十分常见。
+
+###### 优点：用户态开发，调试更方便
+
+  各种各样的调试和profiling手段，工具。程序挂了直接重启就行，解决coredump十分方便。虽然内核调试的技术也很多，但相对用户态而言显然更困难。何况招一个写应用的程序员，相对一个精通Kernel的程序员也方便的多（这主要是应用开发的需求比较多决定的）。
+
+不过没有免费的午餐，我们还是要看看kernel-bypass面临的问题，
+
+###### 缺点：太费事（too expensive）
+
+  Kernel被bypass之后，协议栈也就没有了，我们需要在用户态重建TCP/IP协议栈，想象一下这里有多大的effert！而且重新实现一个协议栈，多少人有把握哪怕只是完成？更别说它能和Kernel一样稳定，能应付各种正常、异常情况，适用不同的场景保持高效和无bug？
+
+  这里说明两点，
+
+  1. 从0开始很难，但我们可以站在别人的肩膀上，事实上目前已经有不少各有特色的用户态协议栈了，其中有些是高性能的。seastar, mTCP, LKL, ODP/OFP, LwIP, f-stack, libuinet。比如f-stack，经过自研协议栈后最终还是决定使用了成熟的BSD栈（借鉴了libuinet），然后利用share-nothing思想，让每个CPU运行独立的stack，互不影响。这个做法比较巧妙，即带来客观的性能提升，又有成熟完善的协议栈支撑功能。再比如说LwIP其实更适合嵌入式系统，不太适合服务器。
+
+  2. 有些应用场景其实并不需要完整的协议栈，比如说L2/L3数据转发，比如说4层负载均衡。4层负责均衡只需要4层端口信息（或者app的某个标识），并不需要实现完整的TCP，Socket层。只是实现3层功能（IP，ARP，Route，ICMP）虽然也很麻烦，但比起实现一个TCP或者Socket来说就好很多了。
+
+###### 缺点：失去了多任务的能力
+
+没有了内核协议栈，使用定制的协议栈保证高性能，我们也就同时失去了多任务的能力。网卡会被bypass技术（如DPDK）完全接管，普通的app看不到他们也无法直接使用，使用用户协议栈为了高性能而又隔离了app，他们可能无法在同一个系统上同时运行了。
+
+> 网卡被某个DPDK app接管，就不能在它上面跑ssh这样的应用了，不过可以通过kni技术解决。但kni只是解决一部分问题，毕竟这部分(SSH)数据又通过了协议栈，kni做不到高性能。
+
+不过，这对于单一目的的系统，比如一个服务器只用来做负载均衡器或Web Server就没有这个问题。这也是“通用”与”专用”的例子。
+
+###### 缺点：许多Kernel配套功能用不了
+
+比如ifconfig, ip没有了，tcpdump也很难真正应用，/proc文件没有了，现有的基于这些工具的profiling和监控、部署脚本，一整套配套的东西就无法使用了。更别谈iptalbes，和基于内核调参的优化了。这会给调试、排查问题和运维造成麻烦，还会增加工具、脚本等套设施开发的成本。是的，用户态应用本身的开发是变方便了，相关配套的成熟的东西却少了。
+
+###### 缺点：稳定性、安全等
+
+通过kernel-bypass，不谈工作量。新用户态协议栈稳定性（包括上述的f-stack, mtcp, seastar等）来看，它们显然没有经过Kernel那么多年的沉淀，而且有多少项目能有Kernel那么数量庞大又顶级的程序员参与，长期的高质量的保证（包括各个稳定发布版本）？除了稳定性，安全性如何保证，包括安全相关的功能和代码本身的安全性会不会有很多漏洞？这些也是问题。
+
+###### Kernel-bypass的引用场景
+
+分析了有缺点，就可以来看看它适合的应用场景了。总得来说包含两种场景：
+
+* 高性能要求
+* 低延迟要求
+
+这样的场景包括
+
+* 高频交易：需要超低延时，用户态定制的协议栈和polling模型可以保证低延时。
+* 数据转发：这个属于高性能要求，包括2,3层交换、路由，和负载均衡器等。
+* 抗DDoS：DDoS的大量的packet会在Kernel造成中断消耗过多CPU的问题，Kernel的pps能力不足。
+
+可以看到其实数据转发和抗DDoS并不需要完整的协议栈支持，所以是应用kernel-bypass的合适场景。
+
+> 当然Kernel也在不停的进化，比如说我们这里的提到的开源Ali/LVS，它的内核还是2.6.32，已经是非常“老”的Kernel了。Kernel对性能的追求从未止步过，多年前的"中断+轮询"，设备驱动napi/上下半部改造，RPS/LRO/GRO/..., REUSEPORT, 等等各种优化的引入，包括最近的XDP/eBFP方面的努力（也许正是针对DPDK这种kernel-bypass的威胁），facebook也开源了基于XDP的负载均衡器。还有不断进行中的各种TCP层，Socket层的优化，手段如此之多。所以说`Kernal-bypass`技术和Kernel自身的演化和对比应该是个动态的过程。
+
+### Share-nothing思想
+### 避免上下文切换
+### 使用Polling而非中断
+### 避免数据拷贝
+
+网络数据通过内核和用户态边界的时候，不但有系统调用的开销，还需要一次额外的数据拷贝。如果能从网卡DMA到内存后，整个处理过程不存在额外的拷贝，也能提高性能。Linux的Sendfile机制就可以避免这种拷贝开销。而Kernel-bypass方案可以避免用户态/内核直接的拷贝，对于用户态转发数据而言会有两次拷贝。
+
+> 当然内核态实现的ipvs，是不需要把数据copy到用户态的，只是说使用kernel-bypass,是可以实现zero-copy的。
+
+参考资料
+=======
+
+* LVS (ipvs/ipvsadm/keepalived)
+* Linux Network Stack
+* Alibaba/LVS
+* DPDK
+* Kernel-bypass
+  - https://blog.cloudflare.com/kernel-bypass/
+  - https://blog.cloudflare.com/why-we-use-the-linux-kernels-tcp-stack/)
+  - https://jvns.ca/blog/2016/06/30/why-do-we-use-the-linux-kernels-tcp-stack/
+  - https://www.infoworld.com/article/3189664/networking/sdn-dilemma-linux-kernel-networking-vs-kernel-bypass.html
+  - http://lukego.github.io/blog/2013/01/04/kernel-bypass-networking/
+  - https://technologyevangelist.co/2017/12/05/kernel-bypass-security-bypass/
+  - https://people.netfilter.org/hawk/presentations/LCA2015/net_stack_challenges_100G_LCA2015.pdf
