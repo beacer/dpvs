@@ -510,7 +510,7 @@ DPVS的总体架构图如下，其中几个主要的点包括。
 
     需要保证从某个CPU发出的数据，其相应也落到该CPU上。保证数据连接可以做到CPU本地化（亲和性），这样才能实现连接per-core化，避免加锁。DPVS的方案是按照CPU，合理分配`lip:lport`（即本地Socket地址），针对每个LIP创建的时候，每个CPU会分配到特定的lport，并组成Socket地址，放入池中，需要转换的时候从池中分配。因为分配是按照一定特征进行的，比如“lip加上lport的部分bit位”和某个CPU关联，这样就能结合flow-director将返程的数据定向到正确的CPU。而且，这一方案不需要很多的flow-director条目。因为flow-director只支持8K左右的条目，百万连接情况下，不可能为每个连接设置规则。
 
-  2. 提高分配的性能
+  2. 提高分配的速度
 
     使用一个预先分配的Socket地址池，需要的时候直接从池中取出未用的，使用完成后放回池中。因为维护了“未/已使用”的sa的池，可以以最高的效率分配和释放。`sa_pool`用内存换效率，能很好的解决性能问题，DPVS对性能要求很高，而可用内存往往不是瓶颈。
 
@@ -535,6 +535,51 @@ DPVS的控制基本通过两个工具进行，一个是`ipvsadm`另一个是`dpi
 对外交互使用Unix Socket，各个模块向`ctrl`模块注册sockopt的选项值及其回调函数。选项分GET/SET两大类型，各模块自定义的选项不能冲突。外部工具通过这些"sockopt"选项和模块相关的数据结构来和DPVS交互。之所以没有选择提供RESTFul或者类似各种bus(dbus)的接口或者文本化的协议，因为DPVS并非一个非常复杂的多进程或者分布式架构。类似LVS采用的sockopt选项，在开发上比较便利，使用RESTFul/bus类型的IPC，需要相对比较重的控制面实现。当然这种二进制的需要预定义的”协议”存在版本兼容的问题，DPVS升级比如需要工具配合升级。而且二进制协议不容易调试和扩展，也不容易做到向前兼容，显然控制面对性能要求不高性能不足以作为二进制的理由。Anyway，DPVS作为一个系统该不像分布式系统或者多进程协作系统有很高的对控制面通信部分要求，所以使用二进制类“sockopt”方式还是可以接受的。
 
 ### 数据流（Big Picture）
+
+这里有一张数据走向及函数调用flow的大图<sup>注1</sup>。以Two-arm FullNAT转发模式为例，解释了一个Client “请求”两个方向分组在DPVS中经历的过程。`eth1`是外网接口，`eth0`是内网接口，他们支持`RSS`/`fdir`。
+
+![](pics/dpvs-dataflow.png)
+
+简单解释下上图描述的过程，主要是第一个分组，后续的分组处理过程类似。
+
+Client发送请求，数据包到达`eth1`后，作为inbound的数据，直接RSS到网卡的不同队列。RSS算法可以设置，默认是TCP<sup>注2</sup>，也就是会根据源IP和源TCP端口进行hash，将数据放入某个网卡队列，根据配置在该队列进行RX的CPU收到该分组。收到分组后，调用`netif_deliver_mbuf`进行L2/L3层分用，如果是IPv4分组则交给`ipv4_rcv`函数进入IP层，如果是ARP则交给`neigh_resolve_input`。这略去了许多在netif层的处理细节，比如arp ring的处理，vlan等。
+
+分组进入IP层后，做必要的完整性等检查，在查路由前先经过`PRE_ROUTE`的Hook点。DPVS的IPv4实现了类似*Netfilter*的hook机制，为未来可能的扩展留下足够的灵活度，Hook位置和定义可以直接参考*Netfilter*相关文档。DPVS中负责核心负载均衡转发的`ipvs`模块，在`PRE_ROUTING`点注册了其唯一的回调函数`dp_vs_in`。IP分组在查询路由前，先进入了`ipvs`，因此FNAT等转发有优先级高于路由查找和转发！
+
+`ipvs`模块的实现基本和Linux下的ipvs一致，分组进入`ipvs`模块后，先找对应的"协议"对象，然后根据协议“对象”,进行连接表的查找，连接inbound的第一个分组是没有连接表的，因此需要创建一个新的连接表，对后续的in/outbound的分组进行转发。创建连接的前提是要保证“服务”的存在，DPVS的服务定义如下，
+
+  * 元组`<proto, VIP, vport>`
+  * `match`类型服务
+
+我们知道LVS支持上述第一类服务，比如'tcp:10.123.1.2:80'这样的服务，其中协议是TCP和UDP。而DPVS除了TCP、UDP还支持ICMP的转发<sup>注3</sup>。此外，DPVS支持`match`类型的服务，比如`proto=tcp,from=192.168.0.0-192.168.0.255:1024-2000`，不过主要用于SNAT类型的转发。
+
+如果没有找到预先配置的Service，流程结束分组返回IP层继续处理。如果找到了Service，那么接下来就需要为新连接调度一个Real Server。这时就会用到Service对应的调度器对象，每个Service都被设置了一个调度器。DPVS支持多种调度器（模式），包括
+
+  * Round-Robin，RR
+  * 加权轮寻，WRR
+  * 加权最少连接, WLC
+  * 一致性Hash，ConHash
+
+这些调度算法并不复杂，也很容易查到他们的原理及使用场景。DPVS实现了LVS没有，Maglev所支持的一致性Hash，这样可以方便的用于“有状态”的业务<sup>注4</sup>，以及QUIC类似的应用。前者需要每个client的多次发起的不同请求到达同一个RS去查询RS上维护的状态（例如，购物车，支付）；后者因为同一个QUIC连接，不能用5元组标识，同一个CID的5元组可以改变，因此不使用一致性hash会导致同一个QUIC连接的数据会落在不同的RS导致连接异常。另外，DPVS没有实现LVS所支持的所有调度算法，原因是实际的应用上述这些调度算法就足够了（至少在公司内部是这样），如果确实需要实现其他的算法也不困难。
+
+调度到一个RS后，我们就获得了RS的IP和端口即`<rip:rport>`，对于FallNAT还需要合理的选择`LIP`和`Lport`，`LIP`的选择比较简单，从绑定到Service的多个LIP中RR下一个，而lport的选择就比较重要了。我们之前提到合理分配了lport资源，使得`<lip,lport>`可以让返程数据用来确定CPU。`sa_pool`模块会解决该问题。
+
+至此所以的信息都有了`<proto, cip, cport, vip, vport, lip, lport>`，于是`dp_vs_conn_new`创建一个新的连接，放入per-core的连接Hash表，之后的outbound数据，和后续inbound的数据可以查询到该连接表项。新建、或获取到连接表之后，就可以根据转发模式（FNAT）进行数据传输了(xmit)，这时候涉及`xmit`模块。如果是FullNAT的话，会将分组的源、目的IP端口替换为`<lip,lport,rip,rport>`。
+
+完成转换（Translation）后，将数据通过`ipv4_output`传输出去，期间还涉及路由表、ARP表的查找，就不再细讲了。
+
+> 注1: 做图的时候在DPVS设计早期，其中有个细节有所改变。fdir规则的设置从`ipvs/laddr`模块挪到了后引入的`sa_pool`模块。其他部分基本没有什么变化。另外网卡队列和cpu的对应一般不会按照上图那样去"任意"配置，而采用类似默认配置文件的一对一配置，减少麻烦。
+
+> 注2：关于选用TCP作为RSS条件，这样可以方便测试，例如在一台设备上使用`wrk`模拟多个client时，源IP是一样的，而源端口不同，如果采用基于源IP的RSS hash，就无法让流量分布到不同的CPU。当然，采用基于IP的hash的好处是可以保证分片数据到同一个CPU上，因为如果是基于TCP，分片没有4层信息无法正确hash到第一个分组所在的CPU。另一方面，在返程方向，因为受到LIP资源限制的关系，DPVS使用`<LIP:lport>`结合flow-director来解决返程数据亲和性问题，因为利用率4层端口，返程数据无法处理分片而让分片到达正确的CPU。这也是DPVS不支持分片的一个原因。
+
+> 注3：LVS"支持ICMP"，但限于和Original分组相关的ICMP出错消息。而DPVS支持的是ICMP作为和TCP/UDP同等的protocol，可对ICMP进行调度和FNAT/SNAT转发，比如SNAT情况下，可以从内网Host Ping外网IP。
+
+> 注4：连接模板也可以达到同样目的。
+
+### 与Linux互操作：使用kni接口
+
+
+
 
 ### 思考与改进
 
@@ -572,7 +617,7 @@ DPVS的控制基本通过两个工具进行，一个是`ipvsadm`另一个是`dpi
 * Kernel-bypass相关
   - https://blog.cloudflare.com/kernel-bypass/
   - https://blog.cloudflare.com/why-we-use-the-linux-kernels-tcp-stack/)
-  - https://jvns.ca/blog/2016/06/30/why-do-we-use-the-linux-kernels-tcp-stack/
+  - https://JVNS.ca/blog/2016/06/30/why-do-we-use-the-linux-kernels-tcp-stack/
   - https://www.infoworld.com/article/3189664/networking/sdn-dilemma-linux-kernel-networking-vs-kernel-bypass.html
   - http://lukego.github.io/blog/2013/01/04/kernel-bypass-networking/
   - https://technologyevangelist.co/2017/12/05/kernel-bypass-security-bypass/
