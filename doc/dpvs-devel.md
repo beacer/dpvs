@@ -3,31 +3,9 @@ DPVS开发者指南
 
 # 目录
 
-[第一部分：DPVS介绍及部署](#part-I)
+[第一部分：DPVS设计概要](#port-I)
 
-* [什么是DPVS？](#whats-dpvs)
-  - [什么是4层负载均衡](#whats-lb)
-  - [项目由来](#prog-history)
-  - [DPVS的特点](#dpvs-char)
-* [试用DPVS](#try-dpvs)
-  - [编译、运行](#build-run)
-* [将DPVS用于生产环境](#product)
-  - [转发模型](#fwd-model)
-  - [调度模型](#shed-model)
-  - [单臂与双臂模型](#one-two-arm)
-  - [DPVS部署示例](#deploy)
-    - [外网集群模式](#external-cluster)
-    - [内网集群模式](#internal-cluster)
-    - [主备模式](#master-backup)
-    - [支持bonding和vlan](#bonding-vlan)
-    - [SNAT集群](#snat-cluster)
-    - [SNAT-GRE集群](#snat-gre-cluster)
-  - [监控与运维](#monitor-admin)
-    - [自动化部署](#auto-deploy)
-    - [实现基本监控](#moitoring)
-
-[第二部分：DPVS设计与实现](#port-II)
-
+* [什么是DPVS](#whats-dpvs)
 * [LVS为何无法实现高性能？](#why-lvs-not-quick-enough)
 * [如何提高性能](#high-perf-howto)
   - [Kernel Bypass技术](#kernel-bypass)
@@ -41,6 +19,9 @@ DPVS开发者指南
   - [模块划分](#modules)
   - [数据流(Big Picture)](#big-picture)
   - [选择与取舍](#consideration)
+
+[第二部分：DPVS核心模块实现](#port-II)
+
 * [网络设备和数据收发](#netdev-rxtx)
   - [netif和数据收发](#netif)
   - [虚拟设备](#vdev)
@@ -90,6 +71,9 @@ DPVS开发者指南
 * [其他基础部件](#basic-modules)
   - [timer: 高性能定时器](#timer)
   - [msg: 跨CPU无锁通信](#msg)
+
+[第三部分：控制面、安全及性能调优](#port-II)
+
 * [安全相关主题](#security)
   - [黑名单](#secu-blacklist)
   - [防syn flood攻击：syn-proxy](#secu-synproxy)
@@ -105,74 +89,82 @@ DPVS开发者指南
   - [perf与火焰图](#perf-flamegragh)
   - [一步步改进性能](#perf-optimization)
 
-[第三部分：开源合作与展望](#part-III)
-
-* [开源的好处](#why-open-source)
-* [DPVS开源的一些经验](#open-source-expirence)
-* [持续集成](#ci)
-* [自动化测试](#test-automation)
-* [如何参与项目](#howto-contribute)
-  - [提交bug](#report-bug)
-  - [功能开发与Pull Request](#pull-request)
-  - [提问与讨论](#ask-question-discuss)
-* [项目的未来目标](#future)
-* [参考资料](#references)
-
 ---------------------------------------------------------
 
 <a id='part-I'/>
 
-第一部分：DPVS介绍及部署
+第一部分：DPVS设计概要
 =====================
 
 <a id='whats-dpvs'/>
 
 # 什么是DPVS？
 
-`DPVS`的名字来自与`DPDK`和`LVS`。`LVS`是多年来非常流行的4层负载均衡器，其核心转发部分在Linux内核态实现。而DPDK则是一个快速包处理的库和驱动套件，最早由Intel推出，现在已经成为Linux基金会项目，被广泛应用于各种领域．简而言之，`DPVS`就是“*基于DPDK的高性能4层负载均衡器*”。
+它的名字来自与`DPDK`和`LVS`。`LVS`<sup>1</sup>是多年来非常流行的软件4层负载均衡器，其核心转发部分在Linux内核态实现。而DPDK<sup>2</sup>则是一个快速包处理的库和驱动套件，Linux基金会项目、最早由*Intel*推出，作为*Kernel by-pass*技术的代表目前有着广泛的应用．
 
-> [LVS](http://linuxvirtualserver.org/)最早由大名鼎鼎的[章文嵩博士](http://jm.taobao.org/2016/06/02/zhangwensong-and-load-balance/)开发，随后包括百度，阿里在内的公司对它进行了改造，比如`FullNAT`和`syn-proxy`的引入，还有`SNAT`的patch；如今，随着DPDK等kernel-bypass技术的发展，特别适合对＂４层负载均衡＂这类纯转发设备的性能提升，于是各大公司也纷纷有了DPDK加速负载均衡的项目．
+简而言之，`DPVS`就是“*基于DPDK的高性能4层负载均衡器*”。
 
-`DPVS`的实现在功能上保留了大部分`LVS`的特性，还引入了一些新的功能．实现过程参考了`LVS`及修改版本[alibaba/LVS](https://github.com/alibaba/LVS)，Kernel网络协议栈等，并利用`DPDK`等技术．成功实现多核线性扩展，成倍于`LVS`的性能提升．关键技术总结如下，
+`DPVS`在功能上保留了绝大部分`LVS`的特性，还引入了一些新创新．实现过程当然也参考了`LVS`<sup>3</sup>，Kernel网络协议栈等，底层使用`DPDK`收发分组。成功实现了，成倍于`LVS`的性能提升、多核线性扩展．这里罗列一下其关键技术，
 
-* **kernel-bypass**: 完全用户态实现，一是提升性能，二是方便功能开发、调试．
-* **Share-nothing**: 关键数据*per-CPU*化，避免锁的使用（lockless）
-* **避免上下文切换**：绑定网卡队列，处理线程和CPU，避免调度切换．
-* **批处理化数据收发和处理**：批处理提高效率并采用*Run-to-Complete*模型．
-* **Polling**：使用轮询而非内核的中断+下半部poll，专有CPU完全用于转发.
-* **无锁化的消息系统**：用于高性能的跨CPU通信.
-* 还有 *零拷贝*,*大页内存*，*prefetch* ...
+* *kernel-bypass*
 
-功能方面，`DPVS`则包括了`LVS`的特性和它所没有的一些功能．
+  完全用户态实现，一是提升性能，二是方便功能迭代、开发调试．
+
+* *Share-nothing*
+
+  关键数据*per-CPU*化，避免锁的使用（lockless）
+
+* *避免上下文切换*
+
+  绑定网卡队列，逻辑处理task和CPU，避免调度切换的开销．
+
+* *批处理化数据收发和处理*
+
+  批处理提高效率，采用*Run-to-Complete*模型．
+
+* *Polling*
+
+  使用轮询而非内核采用的中断+下半部，提升性能；CPU完全用于转发.
+
+* *无锁化的消息系统*
+
+  用于高性能场景下的跨CPU通信.
+
+* *零拷贝*,*大页内存*，*prefetch*，*内存池*，... ...
+
+`DPVS`则包括了`LVS`的大部分特性和它所没有的一些功能．
 
 * 多种负载均衡转发模式：`FullNAT`，`DR`，`Tunnel`, `NAT`模式．
+* 集成了`SNAT`模式：可用于IDC内部进行外网访问．
 * 各种*Real Server*调度算法: `RR`, `WLC`, `WRR`, 以及`一致性哈希`.
 * 用户态轻量级高性能IP栈：实现了IPv4, ARP，ICMP，路由和地址管理等．
-* 集成了`SNAT`模式：支持方向代理的同时、可用于IDC内部进行外网访问．
 * 支持`kni`，`vlan`，`tunnel`，`bonding`等多种虚拟设备以适应复杂的IDC环境.
-* `TOA`及新引入的`UOA`模块：用于`FullNAT`模式下`RS`获取真实TCP/UDP Client IP/Port．
-* 安全和QoS相关：`syn-proxy`, 限并发，限流，黑名单, `tc`等模块．
-* 工具支持：`dpip`工具，`keepalived`, `ipvsadm`，`quagga`等支持，用于部署监控。
+* 客户端真实IP获取：除了`TOA`外，DPVS新引入针对UDP的`UOA`模块，用于获取真实Client IP/Port．
+* 安全和QoS相关：`syn-proxy`, 限并发，限流，黑名单, `tc`等模块．可进行扛DDoS和过载保护。
+* 工具支持：`dpip`工具，`keepalived`, `ipvsadm`，`quagga`等支持，用于部署、监控，日常运维。
+
+> 注1：[LVS](http://linuxvirtualserver.org/)最早由[章文嵩博士](http://jm.taobao.org/2016/06/02/zhangwensong-and-load-balance/)开发，随后包括百度，阿里在内的公司对它进行了改造，比如`FullNAT`和`syn-proxy`的引入，还有`SNAT`的实现；如今，随着DPDK等kernel-bypass技术的发展，特别适合对＂４层负载均衡＂这类纯转发设备的性能提升，于是各大公司也纷纷有了DPDK加速负载均衡的项目．
+
+> 注2：www.dpdk.org
+
+> 注3：主要是Alibaba的开源版本[alibaba/LVS](https://github.com/alibaba/LVS)，当然也有其他版本比如[SNAT版本](https://github.com/jlijian3/lvs-snat)和主线Kernel的*netfilter/ipvs*部分。
 
 ---------------------------------------------------------
-
-<a id='part-II'/>
-
-第二部分：DPVS设计与实现
-=====================
 
 <a id='why-lvs-not-quick-enough'/>
 
 # LVS为何无法实现高性能？
 
-其实LVS的性能瓶颈主要受限于Kernel，这么说也许许多人也许会很奇怪，毕竟Kernel一向给人以高水准，高性能的印象。而且多年来Kernel对网络部分的优化也从未停止，为何会成为性能瓶颈？ 首先，我们先看两组数据，一组是Google `Maglev`的，一组是`mTCP`的，这样对内核性能瓶颈有个直观的印象。
+先给出结论，其实LVS的性能瓶颈主要受限于Kernel，这么说也许有人会奇怪，毕竟Kernel一向给人以高水准，高性能的印象。多年来Kernel对网络部分的优化也从未停止，为何会成为性能瓶颈？
+
+首先，我们先看两组数据，一组是Google `Maglev`的，一组是`mTCP`的，这样对内核性能瓶颈有个直观的印象。
 
 <center>
     <img src="pics/maglev-throughput.png" height="220"/>
     <img src="pics/mtcp-cps.png" height="220"/>
 </center>
 
-> 下方左边的图来自Google [Maglev的论文](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/44824.pdf)，右侧的图来自[mTCP的论文](https://www.usenix.org/system/files/conference/nsdi14/nsdi14-paper-jeong.pdf)。
+> 左图出自Google [Maglev的论文](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/44824.pdf)，右图来自[mTCP的论文](https://www.usenix.org/system/files/conference/nsdi14/nsdi14-paper-jeong.pdf)。
 
 不难看出，一方面在一个CPU core的情况下，基于kernel的方案在性能上就不如Bypass的方案；另一方面，现代SMP多CPU核的情况下Bypass的方案可以实现性能线性扩展，但是kernel却无法做到。
 
